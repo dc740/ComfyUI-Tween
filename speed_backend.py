@@ -32,6 +32,36 @@ def _namespace_package(name: str, path: Path) -> None:
     sys.modules[name] = package
 
 
+
+def _patch_attention_gfx906(namespace: str) -> None:
+    """Route upstream SDPA through ComfyUI chunked attention.
+
+    gfx906 has no fused SDPA kernels (flash/mem-eff/cudnn all fail), so the
+    MATH fallback materializes QK^T -> ~71GB at 4K. ComfyUI's sub-quadratic
+    attention chunks KV and is proven on this arch via the SeedVR2 path.
+    Patches here (pack file) instead of _upstream so re-pinning the runtime
+    does not silently drop the fix.
+    """
+    try:
+        from comfy.ldm.modules.attention import attention_sub_quad
+        attn_mod = sys.modules.get(f"{namespace}.src.models.modules.attention")
+        if attn_mod is None:
+            attn_mod = importlib.import_module(f"{namespace}.src.models.modules.attention")
+
+        def _chunked_attention(q, k, v, scale):
+            heads = q.shape[2]  # upstream layout [B, N, H, D]
+            o = attention_sub_quad(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                heads, scale=scale, skip_reshape=True, skip_output_reshape=True,
+            )
+            return o.transpose(1, 2)
+
+        attn_mod.memory_efficient_attention = _chunked_attention
+        logger.info("SPEED: patched upstream attention -> comfy chunked (gfx906)")
+    except Exception as exc:  # noqa: BLE001 - never break model load over this
+        logging.getLogger(__name__).warning("SPEED attention patch skipped: %s", exc)
+
+
 def load_speed_model_class(source_root: str):
     """Import SpeedDiT without adding the upstream repository to sys.path."""
     root = Path(source_root).resolve()
@@ -43,6 +73,7 @@ def load_speed_model_class(source_root: str):
     _namespace_package(f"{_SPEED_NAMESPACE}.src", root / "src")
     _namespace_package(f"{_SPEED_NAMESPACE}.src.models", root / "src" / "models")
     module = importlib.import_module(f"{_SPEED_NAMESPACE}.src.models.model")
+    _patch_attention_gfx906(_SPEED_NAMESPACE)
     return module.SpeedDiT
 
 
