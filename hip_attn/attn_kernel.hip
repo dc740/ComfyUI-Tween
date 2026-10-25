@@ -10,6 +10,13 @@
 #define USE_DOT2 1
 #endif
 
+// packed-fp16 PV accumulate: fp16x2 partial sums over each K/V tile, folded
+// into the fp32 accumulators at tile end (bounds fp16 drift to TILE_N keys).
+// -DGFX906_NO_PKFMA falls back to the scalar fma_mix loops.
+#if !defined(GFX906_NO_PKFMA) && !defined(USE_PKFMA)
+#define USE_PKFMA 1
+#endif
+
 #ifndef TILE_M
 #define TILE_M 64
 #endif
@@ -53,6 +60,12 @@ static __device__ __forceinline__ float p2f(PTYPE x) {
 static __device__ __forceinline__ PTYPE f2p(float x) {
     if constexpr (sizeof(PTYPE) == 2) return __float2half(x); else return x;
 }
+#ifdef USE_PKFMA
+static __device__ __forceinline__ H2 p2h2(PTYPE x) {
+    if constexpr (sizeof(PTYPE) == 2) return __half2half2((__half)x);
+    else return __floats2half2_rn(x, x);
+}
+#endif
 
 // q,k,v,o: [B,H,S,D] fp16, contiguous. Requires D % 8 == 0, D <= DMAX.
 template<int DT>
@@ -149,6 +162,24 @@ attn_tiled_gfx906(
             #pragma unroll
             for (int d = 0; d < DMAX; ++d)
                 if (d < de) acc[d] *= rs;
+#ifdef USE_PKFMA
+            H2 hacc[D2] = {};
+            #pragma unroll 4
+            for (int i = 0; i < nmax; ++i) {
+                H2 pp = p2h2(p[i]);
+                #pragma unroll
+                for (int d2 = 0; d2 < D2; ++d2)
+                    if (d2 * 2 < de)
+                        hacc[d2] = __hfma2(pp, sV[i][d2], hacc[d2]);
+            }
+            #pragma unroll
+            for (int d2 = 0; d2 < D2; ++d2)
+                if (d2 * 2 < de) {
+                    float2 f = __half22float2(hacc[d2]);
+                    acc[2 * d2]     += f.x;
+                    acc[2 * d2 + 1] += f.y;
+                }
+#else
             #pragma unroll 4
             for (int i = 0; i < nmax; ++i) {
                 PTYPE pi = p[i];
@@ -162,6 +193,7 @@ attn_tiled_gfx906(
                     }
                 }
             }
+#endif
             l = l * rs + psum;
             m = m_new;
         }
@@ -323,6 +355,22 @@ attn_pair_gfx906(
             float rs = (l > 0.f) ? __expf(m - m_new) : 0.f;
             #pragma unroll
             for (int d = 0; d < DH; ++d) acc[d] *= rs;
+#ifdef USE_PKFMA
+            H2 hacc[DQ] = {};
+            #pragma unroll 4
+            for (int i = 0; i < nmax; ++i) {
+                H2 pp = p2h2(p[i]);
+                #pragma unroll
+                for (int d2 = 0; d2 < DQ; ++d2)
+                    hacc[d2] = __hfma2(pp, sV[i][sub * DQ + d2], hacc[d2]);
+            }
+            #pragma unroll
+            for (int d2 = 0; d2 < DQ; ++d2) {
+                float2 f = __half22float2(hacc[d2]);
+                acc[2 * d2]     += f.x;
+                acc[2 * d2 + 1] += f.y;
+            }
+#else
             #pragma unroll 4
             for (int i = 0; i < nmax; ++i) {
                 PTYPE pi = p[i];
@@ -334,6 +382,7 @@ attn_pair_gfx906(
                     acc[2 * d2 + 1] += pif * vf.y;
                 }
             }
+#endif
             l = l * rs + psum;
             m = m_new;
         }
@@ -470,6 +519,29 @@ attn_d512_gfx906(
             float psum = 0.f;
             #pragma unroll
             for (int d = 0; d < DH; ++d) acc[d] *= rs;
+#ifdef USE_PKFMA
+            H2 hacc[DH / 2] = {};
+            #pragma unroll 4
+            for (int i = 0; i < nmax; ++i) {
+                float e = __expf(sE[row][i] - m_new);
+                psum += e;
+                H2 ee = __floats2half2_rn(e, e);
+                #pragma unroll
+                for (int d2 = 0; d2 < DH / 2; d2 += 4) {
+                    int d2h = d2 * TN + sub * 4;
+                    hacc[d2]     = __hfma2(ee, sKV[i][d2h],     hacc[d2]);
+                    hacc[d2 + 1] = __hfma2(ee, sKV[i][d2h + 1], hacc[d2 + 1]);
+                    hacc[d2 + 2] = __hfma2(ee, sKV[i][d2h + 2], hacc[d2 + 2]);
+                    hacc[d2 + 3] = __hfma2(ee, sKV[i][d2h + 3], hacc[d2 + 3]);
+                }
+            }
+            #pragma unroll
+            for (int d2 = 0; d2 < DH / 2; ++d2) {
+                float2 f = __half22float2(hacc[d2]);
+                acc[2 * d2]     += f.x;
+                acc[2 * d2 + 1] += f.y;
+            }
+#else
             #pragma unroll 4
             for (int i = 0; i < nmax; ++i) {
                 float e = __expf(sE[row][i] - m_new);
@@ -491,6 +563,7 @@ attn_d512_gfx906(
                     acc[2 * d2 + 7] += e * v3.y;
                 }
             }
+#endif
             l = l * rs + psum;
             m = m_new;
         }
