@@ -34,22 +34,39 @@ def _namespace_package(name: str, path: Path) -> None:
 
 
 def _patch_attention_gfx906(namespace: str) -> None:
-    """Route upstream SDPA through ComfyUI chunked attention.
+    """Route upstream SDPA through the gfx906 kernel, else ComfyUI chunked.
 
     gfx906 has no fused SDPA kernels (flash/mem-eff/cudnn all fail), so the
-    MATH fallback materializes QK^T -> ~71GB at 4K. ComfyUI's sub-quadratic
-    attention chunks KV and is proven on this arch via the SeedVR2 path.
-    Patches here (pack file) instead of _upstream so re-pinning the runtime
-    does not silently drop the fix.
+    MATH fallback materializes QK^T -> ~71GB at 4K. The custom HIP kernel
+    (hip_attn/, online softmax, no QK^T) covers head_dim<=64; bf16 inputs
+    (SPEED's autocast default) are cast to fp16 for the kernel. Anything
+    else uses ComfyUI's sub-quadratic chunked attention, proven on
+    this arch via the SeedVR2 path. Patches here (pack file) instead of
+    _upstream so re-pinning the runtime does not silently drop the fix.
     """
     try:
         from comfy.ldm.modules.attention import attention_sub_quad
+        from . import gfx906_attn
         attn_mod = sys.modules.get(f"{namespace}.src.models.modules.attention")
         if attn_mod is None:
             attn_mod = importlib.import_module(f"{namespace}.src.models.modules.attention")
 
+        kernel = gfx906_attn.load_attention()
+
         def _chunked_attention(q, k, v, scale):
             heads = q.shape[2]  # upstream layout [B, N, H, D]
+            if (kernel is not None and q.is_cuda
+                    and q.shape[-1] <= 64 and q.shape[-1] % 8 == 0
+                    and q.dtype in (torch.float16, torch.bfloat16)):
+                try:
+                    return kernel.attn(
+                        q.transpose(1, 2).half(),
+                        k.transpose(1, 2).half(),
+                        v.transpose(1, 2).half(),
+                        scale,
+                    ).transpose(1, 2).to(q.dtype)
+                except RuntimeError:
+                    pass  # fall back to chunked attention below
             o = attention_sub_quad(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                 heads, scale=scale, skip_reshape=True, skip_output_reshape=True,
@@ -57,7 +74,8 @@ def _patch_attention_gfx906(namespace: str) -> None:
             return o.transpose(1, 2)
 
         attn_mod.memory_efficient_attention = _chunked_attention
-        logger.info("SPEED: patched upstream attention -> comfy chunked (gfx906)")
+        logger.info("SPEED: patched upstream attention -> %s (gfx906)",
+                    "hip_attn kernel" if kernel is not None else "comfy chunked")
     except Exception as exc:  # noqa: BLE001 - never break model load over this
         logging.getLogger(__name__).warning("SPEED attention patch skipped: %s", exc)
 
