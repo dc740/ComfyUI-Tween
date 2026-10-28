@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 hip_attn/.build_failed
+.session-state
+.aider*
+.pi/
+*.o
